@@ -1,9 +1,9 @@
 # office-retail-to-volume-pwsh
-A PowerShell script to convert Office 2019 from Retail to Volume (KMS). In the future, the script may be updated to support other Office products.
+A PowerShell script to convert Office 2019/2021/2024 from Retail to Volume (KMS).
 
-Version: 0.3  
-Create date: 27-August-2025  
-Last update: 27-August-2025  
+Version: 0.7  
+Create date: 26-August-2025  
+Last update: 28-August-2025  
 
 Requires: PowerShell 5.1+ and Administrator privileges
 
