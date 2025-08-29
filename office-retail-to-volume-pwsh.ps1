@@ -4,9 +4,9 @@
 .DESCRIPTION
     Converts Office 2019, 2021, and 2024 Retail installation to Volume License with error handling, detection, and KMS-only license file installation
 .NOTES
-    Version: 0.7
+    Version: 0.8
     Create date: 26-August-2025
-    Last update: 28-August-2025
+    Last update: 29-August-2025
     Requires: PowerShell 5.1+ and Administrator privileges
     Run "Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force" if current policy is "restricted"
     Author: Harry Hoang Le
@@ -225,43 +225,305 @@ function Get-OfficeInstallPath {
 function Get-OfficeVersion {
     param([string]$OfficePath)
     
+    Write-Log "Determining Office version from path: $OfficePath" -Level Info
+    
+    # First check: Office folder name pattern
+    $folderVersion = "Unknown"
     if ($OfficePath -match "Office16") {
-        # Could be 2019, 2021, or 2024 - need to check registry for more specific version
-        try {
-            $config = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration" -ErrorAction SilentlyContinue
-            if (-not $config) {
-                $config = Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration" -ErrorAction SilentlyContinue
-            }
-            
-            if ($config.VersionToReport) {
-                $version = $config.VersionToReport
-                Write-Log "Detected Office version from registry: $version" -Level Info
+        $folderVersion = "16.0"
+    }
+    elseif ($OfficePath -match "Office15") {
+        return "2013"  # Office 2013 is clearly identifiable
+    }
+    elseif ($OfficePath -match "Office14") {
+        return "2010"  # Office 2010 is clearly identifiable
+    }
+    
+    # For Office16 folder, we need more detailed detection
+    if ($folderVersion -eq "16.0") {
+        Write-Log "Detected Office 16.0 folder, determining specific version..." -Level Info
+        
+        # Method 1: Check registry version information (most reliable)
+        $registryVersion = Get-OfficeVersionFromRegistry
+        if ($registryVersion -ne "Unknown") {
+            Write-Log "Registry detection returned: $registryVersion" -Level Info
+            return $registryVersion
+        }
+        
+        # Method 2: Check file versions of key Office executables
+        $fileVersion = Get-OfficeVersionFromFiles -OfficePath $OfficePath
+        if ($fileVersion -ne "Unknown") {
+            Write-Log "File version detection returned: $fileVersion" -Level Info
+            return $fileVersion
+        }
+        
+        # Method 3: Check product information from WMI/installed programs
+        $productVersion = Get-OfficeVersionFromProducts
+        if ($productVersion -ne "Unknown") {
+            Write-Log "Product detection returned: $productVersion" -Level Info
+            return $productVersion
+        }
+        
+        # Method 4: Check license files presence (fallback method)
+        $licenseVersion = Get-OfficeVersionFromLicenseFiles -OfficePath $OfficePath
+        if ($licenseVersion -ne "Unknown") {
+            Write-Log "License file detection returned: $licenseVersion" -Level Info
+            return $licenseVersion
+        }
+        
+        # If all methods fail, default to 2019 with warning
+        Write-Log "Could not determine specific Office version, defaulting to 2019. This may not be accurate." -Level Warning
+        return "2019"
+    }
+    
+    Write-Log "Could not determine Office version from path pattern" -Level Warning
+    return "Unknown"
+}
+
+function Get-OfficeVersionFromRegistry {
+    Write-Log "Attempting to detect Office version from registry..." -Level Info
+    
+    $registryPaths = @(
+        @{ Path = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"; Arch = "64-bit" },
+        @{ Path = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"; Arch = "32-bit" }
+    )
+    
+    foreach ($regPath in $registryPaths) {
+        if (Test-Path $regPath.Path) {
+            try {
+                $config = Get-ItemProperty -Path $regPath.Path -ErrorAction Stop
                 
-                # Parse version to determine Office edition
-                if ($version -match "^16\.0\.1\d{4}\.") {
-                    $buildNumber = [int]($version -replace "^16\.0\.(\d{5})\..*", '$1')
-                    if ($buildNumber -ge 17928) {
+                # Check VersionToReport first (most reliable)
+                if ($config.VersionToReport) {
+                    $version = $config.VersionToReport
+                    Write-Log "Found VersionToReport: $version" -Level Info
+                    
+                    # Parse version string to determine Office edition
+                    if ($version -match "^16\.0\.(\d{5})\.") {
+                        $buildNumber = [int]$matches[1]
+                        Write-Log "Detected build number: $buildNumber" -Level Info
+                        
+                        # Updated build number ranges based on official Microsoft releases
+                        if ($buildNumber -ge 17928) {
+                            # Office 2024 (builds 17928+)
+                            return "2024"
+                        }
+                        elseif ($buildNumber -ge 14332) {
+                            # Office 2021 (builds 14332-17927)
+                            return "2021"
+                        }
+                        elseif ($buildNumber -ge 10827) {
+                            # Office 2019 (builds 10827-14331)
+                            return "2019"
+                        }
+                        elseif ($buildNumber -ge 4266) {
+                            # Office 2016 (builds 4266-10826)
+                            return "2016"
+                        }
+                        else {
+                            Write-Log "Build number $buildNumber is below expected range for Office 2016+" -Level Warning
+                        }
+                    }
+                }
+                
+                # Check ProductReleaseIds as secondary method
+                if ($config.ProductReleaseIds) {
+                    $productIds = $config.ProductReleaseIds
+                    Write-Log "Found ProductReleaseIds: $productIds" -Level Info
+                    
+                    # Check for specific product patterns
+                    if ($productIds -match "2024") {
                         return "2024"
                     }
-                    elseif ($buildNumber -ge 14332) {
-                        return "2021"  
+                    elseif ($productIds -match "2021") {
+                        return "2021"
                     }
-                    else {
+                    elseif ($productIds -match "2019") {
                         return "2019"
+                    }
+                    elseif ($productIds -match "2016") {
+                        return "2016"
+                    }
+                    # Office 2016 sometimes doesn't have year in ProductReleaseIds
+                    elseif ($productIds -match "ProPlusRetail|ProPlusVolume" -and $productIds -notmatch "202[1-4]|2019") {
+                        Write-Log "Detected generic ProPlus product ID, likely Office 2016" -Level Info
+                        return "2016"
+                    }
+                }
+                
+                # Check InstallationPath for additional clues
+                if ($config.InstallationPath) {
+                    $installPath = $config.InstallationPath
+                    Write-Log "Installation path: $installPath" -Level Info
+                    
+                    # Some installations have version-specific folders
+                    if ($installPath -match "2024|Office24") {
+                        return "2024"
+                    }
+                    elseif ($installPath -match "2021|Office21") {
+                        return "2021"
+                    }
+                    elseif ($installPath -match "2019|Office19") {
+                        return "2019"
+                    }
+                    elseif ($installPath -match "2016|Office16") {
+                        return "2016"
+                    }
+                }
+                
+            }
+            catch {
+                Write-Log "Error reading registry path $($regPath.Path): $($_.Exception.Message)" -Level Warning
+            }
+        }
+    }
+    
+    return "Unknown"
+}
+
+function Get-OfficeVersionFromFiles {
+    param([string]$OfficePath)
+    
+    Write-Log "Attempting to detect Office version from file versions..." -Level Info
+    
+    # Key files to check for version information
+    $filesToCheck = @(
+        "WINWORD.EXE",
+        "EXCEL.EXE", 
+        "POWERPNT.EXE",
+        "OUTLOOK.EXE",
+        "MSACCESS.EXE"
+    )
+    
+    foreach ($fileName in $filesToCheck) {
+        $filePath = Join-Path $OfficePath $fileName
+        if (Test-Path $filePath) {
+            try {
+                $fileVersion = (Get-ItemProperty -Path $filePath).VersionInfo.FileVersion
+                if ($fileVersion) {
+                    Write-Log "Found file version for $fileName : $fileVersion" -Level Info
+                    
+                    # Parse file version to determine Office version
+                    if ($fileVersion -match "^16\.0\.(\d{5})\.") {
+                        $buildNumber = [int]$matches[1]
+                        
+                        if ($buildNumber -ge 17928) {
+                            return "2024"
+                        }
+                        elseif ($buildNumber -ge 14332) {
+                            return "2021"
+                        }
+                        elseif ($buildNumber -ge 10827) {
+                            return "2019"
+                        }
+                        elseif ($buildNumber -ge 4266) {
+                            return "2016"
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Log "Could not get version info for $fileName : $($_.Exception.Message)" -Level Warning
+            }
+        }
+    }
+    
+    return "Unknown"
+}
+
+function Get-OfficeVersionFromProducts {
+    Write-Log "Attempting to detect Office version from installed products..." -Level Info
+    
+    try {
+        # Check WMI for installed products
+        $products = Get-WmiObject -Class Win32_Product -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Name -match "Microsoft Office|Microsoft 365" }
+        
+        foreach ($product in $products) {
+            $productName = $product.Name
+            Write-Log "Found installed product: $productName" -Level Info
+            
+            if ($productName -match "2024") {
+                return "2024"
+            }
+            elseif ($productName -match "2021") {
+                return "2021"
+            }
+            elseif ($productName -match "2019") {
+                return "2019"
+            }
+            elseif ($productName -match "2016") {
+                return "2016"
+            }
+        }
+        
+        # Check registry uninstall information as alternative
+        $uninstallKeys = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+        
+        foreach ($keyPath in $uninstallKeys) {
+            $programs = Get-ItemProperty -Path $keyPath -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -match "Microsoft Office|Microsoft 365" }
+            
+            foreach ($program in $programs) {
+                if ($program.DisplayName) {
+                    $displayName = $program.DisplayName
+                    Write-Log "Found uninstall entry: $displayName" -Level Info
+                    
+                    if ($displayName -match "2024") {
+                        return "2024"
+                    }
+                    elseif ($displayName -match "2021") {
+                        return "2021"
+                    }
+                    elseif ($displayName -match "2019") {
+                        return "2019"
+                    }
+                    elseif ($displayName -match "2016") {
+                        return "2016"
                     }
                 }
             }
         }
-        catch {
-            Write-Log "Could not determine specific Office version, defaulting to 2019" -Level Warning
+    }
+    catch {
+        Write-Log "Error checking installed products: $($_.Exception.Message)" -Level Warning
+    }
+    
+    return "Unknown"
+}
+
+function Get-OfficeVersionFromLicenseFiles {
+    param([string]$OfficePath)
+    
+    Write-Log "Attempting to detect Office version from license files..." -Level Info
+    
+    # Check for license files in the expected locations
+    $baseFolder = Split-Path $OfficePath -Parent
+    $licenseFolder = Join-Path $baseFolder "root\Licenses16"
+    
+    if (Test-Path $licenseFolder) {
+        $licenseFiles = Get-ChildItem -Path $licenseFolder -Filter "*.xrm-ms" -ErrorAction SilentlyContinue
+        
+        foreach ($file in $licenseFiles) {
+            $fileName = $file.Name
+            Write-Log "Found license file: $fileName" -Level Info
+            
+            if ($fileName -match "2024") {
+                return "2024"
+            }
+            elseif ($fileName -match "2021") {
+                return "2021"
+            }
+            elseif ($fileName -match "2019") {
+                return "2019"
+            }
+            elseif ($fileName -match "2016") {
+                return "2016"
+            }
         }
-        return "2019"
-    }
-    elseif ($OfficePath -match "Office15") {
-        return "2013"
-    }
-    elseif ($OfficePath -match "Office14") {
-        return "2010"
     }
     
     return "Unknown"
@@ -896,8 +1158,8 @@ function Show-Banner {
     Write-Host @"
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║        Office 2019/2021/2024 Retail to Volume License Converter       ║
-║                    Version 0.7                                        ║
-║                    Last update: 28-August-2025                        ║
+║                    Version 0.8                                        ║
+║                    Last update: 29-August-2025                        ║
 ║                    Author: Harry Hoang Le                             ║
 ║                                                                       ║
 ║  Supported Products:                                                  ║
@@ -1152,8 +1414,8 @@ function Main {
     }
     finally {
         Save-Log
-        Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
-        Read-Host
+        Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     }
 }
 
